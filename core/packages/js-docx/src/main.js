@@ -8,6 +8,9 @@ class JsDocxPreview {
     options = {};
     requestOptions = {};
     fileData = null;
+    renderVersion = 0;
+    destroyed = false;
+    requestController = null;
     
     constructor(container, options={}, requestOptions={}) {
         this.container = container;
@@ -31,17 +34,50 @@ class JsDocxPreview {
         this.requestOptions = requestOptions;
     }
     preview(src){
+        const version = ++this.renderVersion;
+        this.cancelRequest();
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        this.requestController = controller;
+        const requestOptions = controller
+            ? {...this.requestOptions, signal: controller.signal}
+            : this.requestOptions;
         return new Promise((resolve, reject) => {
-            docx.getData(src, this.requestOptions).then(async res =>{
+            docx.getData(src, requestOptions).then(async res =>{
+                if(this.requestController === controller){
+                    this.requestController = null;
+                }
+                if(this.destroyed || version !== this.renderVersion){
+                    resolve();
+                    return;
+                }
                 this.fileData = await docx.getBlob(res);
+                if(this.destroyed || version !== this.renderVersion){
+                    resolve();
+                    return;
+                }
                 docx.render(this.fileData, this.wrapperMain, this.options).then(() => {
+                    if(this.destroyed || version !== this.renderVersion){
+                        resolve();
+                        return;
+                    }
                     resolve();
                 }).catch(e => {
-                    docx.render('', this.wrapperMain, this.options);
+                    if(this.destroyed || version !== this.renderVersion){
+                        resolve();
+                        return;
+                    }
+                    this.wrapperMain.innerHTML = '';
                     reject(e);
                 });
             }).catch(err=>{
-                docx.render('', this.wrapperMain, this.options);
+                if(this.requestController === controller){
+                    this.requestController = null;
+                }
+                if(this.destroyed || version !== this.renderVersion){
+                    resolve();
+                    return;
+                }
+                this.wrapperMain.innerHTML = '';
                 reject(err);
             });
         });
@@ -50,12 +86,24 @@ class JsDocxPreview {
         downloadFile(fileName || `js-preview-docx-${new Date().getTime()}.docx`,this.fileData);
     }
     destroy(){
+        if(this.destroyed){
+            return;
+        }
+        this.destroyed = true;
+        this.renderVersion += 1;
+        this.cancelRequest();
         this.container.removeChild(this.wrapper);
         this.container = null;
         this.wrapper = null;
         this.wrapperMain = null;
         this.options = null;
         this.requestOptions = null;
+    }
+    cancelRequest(){
+        if(this.requestController){
+            this.requestController.abort();
+            this.requestController = null;
+        }
     }
 }
 export function init(container, options, requestOptions){

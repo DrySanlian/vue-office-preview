@@ -2,7 +2,7 @@
 import { defineComponent, ref, onMounted, watch, onBeforeUnmount } from 'vue-demi';
 import workerStr from './worker?raw';
 import pdfjsLib from './pdf?raw';
-import { download as downloadFile, getUrl, loadScript } from '../../../utils/url';
+import { download as downloadFile, getUrlInfo, loadScript } from '../../../utils/url';
 import { base64_encode } from '../../../utils/base64';
 import omit from 'lodash/omit';
 import {debounce} from "lodash/function";
@@ -51,25 +51,66 @@ export default defineComponent({
         let canvasHeight = 0; //画布的尺寸-高
 
         let loopCheckTimer = null;
+        let renderVersion = 0;
+        let destroyed = false;
+        let renderTasks = new Set();
 
         let getViewportScale = 2;
         let userScale = ref(props.options.defaultScale || 1);
 
-        onBeforeUnmount(()=>{
-            if(pdfDocument === null){
-                return;
+        function isCurrent(version){
+            return !destroyed && version === renderVersion;
+        }
+
+        function cancelRenderTasks(){
+            renderTasks.forEach(task => {
+                try {
+                    task.cancel();
+                } catch (e) {
+                    // A finished PDF render task cannot be cancelled twice.
+                }
+            });
+            renderTasks.clear();
+        }
+
+        function invalidatePreview(){
+            renderVersion += 1;
+            cancelRenderTasks();
+            if (loadingTask) {
+                const task = loadingTask;
+                loadingTask = null;
+                try {
+                    const result = task.destroy();
+                    result && typeof result.catch === 'function' && result.catch(() => {});
+                } catch (e) {
+                    // The loading task may already be settled.
+                }
             }
-            pdfDocument.destroy();
-            pdfDocument = null;
-            loadingTask = null;
+            if (pdfDocument) {
+                try {
+                    const result = pdfDocument.destroy();
+                    result && typeof result.catch === 'function' && result.catch(() => {});
+                } catch (e) {
+                    // The PDF document may already be destroyed.
+                }
+                pdfDocument = null;
+            }
             loopCheckTimer && clearTimeout(loopCheckTimer);
+            loopCheckTimer = null;
+            clearCanvas();
+            return renderVersion;
+        }
+
+        onBeforeUnmount(()=>{
+            destroyed = true;
+            invalidatePreview();
         });
         function getScale(){
-            return userScale;
+            return userScale.value;
         }
         function setScale(scale){
             userScale.value = scale;
-            init();
+            startPreview();
         }
         function installPdfScript() {
             return loadScript(pdfJsLibSrc).then(() => {
@@ -108,28 +149,54 @@ export default defineComponent({
         }
 
         function clearCanvas(){
-            wrapperRef.value.innerHTML = '';
+            if (wrapperRef.value) {
+                wrapperRef.value.innerHTML = '';
+            }
         }
-        function init() {
+        function init(version) {
+            if (!isCurrent(version)) {
+                return;
+            }
             if (!props.src) {
-                clearCanvas();
                 emit('error', new Error('src不能为空'))
                 return;
             }
-            loadingTask = window.pdfjsLib.getDocument({
-                url: getUrl(props.src, { type: 'application/pdf' }),
-                // httpHeaders: props.requestOptions && props.requestOptions.headers,
-                withCredentials: props.requestOptions && props.requestOptions.withCredentials,
-                cMapUrl: `${props.staticFileUrl.endsWith('/') ? props.staticFileUrl : props.staticFileUrl + '/'}cmaps/`,
-                cMapPacked: true,
-                enableXfa: true,
-                ...omit(props.options, ['width'])
-            });
-            loadingTask.promise.then((pdf) => {
-                pdfDocument && pdfDocument.destroy();
+            const source = getUrlInfo(props.src, { type: 'application/pdf' });
+            let currentTask;
+            try {
+                currentTask = window.pdfjsLib.getDocument({
+                    url: source.url,
+                    httpHeaders: props.requestOptions && props.requestOptions.headers,
+                    withCredentials: props.requestOptions && props.requestOptions.withCredentials,
+                    cMapUrl: `${props.staticFileUrl.endsWith('/') ? props.staticFileUrl : props.staticFileUrl + '/'}cmaps/`,
+                    cMapPacked: true,
+                    enableXfa: true,
+                    ...omit(props.options, ['width'])
+                });
+            } catch (e) {
+                source.revoke();
+                emit('error', e);
+                return;
+            }
+            loadingTask = currentTask;
+            currentTask.promise.then((pdf) => {
+                source.revoke();
+                if (!isCurrent(version)) {
+                    pdf.destroy();
+                    return;
+                }
+                if (pdfDocument) {
+                    const result = pdfDocument.destroy();
+                    result && typeof result.catch === 'function' && result.catch(() => {});
+                }
                 pdfDocument = pdf;
+                loadingTask = null;
 
-                getPageSize(pdfDocument).then(res =>{
+                return getPageSize(pdfDocument).then(res =>{
+                    if (!isCurrent(version)) {
+                        pdf.destroy();
+                        return;
+                    }
                     totalItems = pdfDocument.numPages;
                     containerHeight = containerRef.value.getBoundingClientRect().height
                     pageWidth = res.width;
@@ -143,10 +210,30 @@ export default defineComponent({
                     wrapperRef.value.style.height = height + 'px';
 
                     clearCanvas();
-                    renderList(1, Math.min(totalItems, visibleItems));
-                })
+                    renderList(1, Math.min(totalItems, visibleItems), version);
+                });
             }).catch((e) => {
-                emit('error', e);
+                source.revoke();
+                if (isCurrent(version)) {
+                    emit('error', e);
+                }
+            });
+        }
+
+        function startPreview(){
+            const version = invalidatePreview();
+            if (!props.src) {
+                emit('error', new Error('src不能为空'));
+                return;
+            }
+            checkPdfLib().then(() => {
+                if (isCurrent(version)) {
+                    init(version);
+                }
+            }).catch(e => {
+                if (isCurrent(version)) {
+                    emit('error', e);
+                }
             });
         }
 
@@ -186,8 +273,6 @@ export default defineComponent({
                     canvasWidth,
                     canvasHeight
                 }
-            }).catch((e) => {
-                emit('error', e);
             });
         }
         const onScrollPdf = debounce(function (e) {
@@ -220,7 +305,10 @@ export default defineComponent({
             canvas.style.height = `${pageHeight}px`;
             return canvas
         }
-        function renderList(startIndex, endIndex){
+        function renderList(startIndex, endIndex, version = renderVersion){
+            if (!isCurrent(version)) {
+                return;
+            }
             let list  = wrapperRef.value;
             let originNodes = [...list.childNodes]
             let tasks = [];
@@ -228,7 +316,7 @@ export default defineComponent({
                 for (let i = startIndex; i <= endIndex; i++) {
                     let canvas = createCanvas(i)
                     list.appendChild(canvas);
-                    tasks.push(renderPage(i, canvas));
+                    tasks.push(renderPage(i, canvas, version));
                 }
             }else{
                 let min = +originNodes[0].getAttribute('data-id');
@@ -237,7 +325,7 @@ export default defineComponent({
                     for (let i = startIndex; i <= endIndex; i++) {
                         let canvas = createCanvas(i)
                         list.appendChild(canvas);
-                        tasks.push(renderPage(i, canvas));
+                        tasks.push(renderPage(i, canvas, version));
                     }
                 }
 
@@ -247,7 +335,7 @@ export default defineComponent({
                         let canvas = createCanvas(i);
                         list.insertBefore(canvas, firstChildNode);
                         firstChildNode = canvas;
-                        tasks.push(renderPage(i, canvas));
+                        tasks.push(renderPage(i, canvas, version));
                     }
                 }
 
@@ -262,18 +350,28 @@ export default defineComponent({
                     for (let i = max + 1; i <= endIndex; i++) {
                         let canvas = createCanvas(i)
                         list.appendChild(canvas);
-                        tasks.push(renderPage(i, canvas));
+                        tasks.push(renderPage(i, canvas, version));
                     }
                 }
             }
             Promise.all(tasks).then(_=>{
-                emit('rendered')
+                if (isCurrent(version)) {
+                    emit('rendered')
+                }
             }).catch(e => {
-                emit('error', e)
+                if (isCurrent(version)) {
+                    emit('error', e)
+                }
             })
         }
-        function renderPage(num, canvas) {
+        function renderPage(num, canvas, version){
+            if (!isCurrent(version)) {
+                return Promise.resolve();
+            }
             return pdfDocument.getPage(num).then((pdfPage) => {
+                if (!isCurrent(version)) {
+                    return;
+                }
                 const viewport = pdfPage.getViewport({ scale: getViewportScale * (userScale.value < 1 ? userScale.value : 1) });
                 let outputScale = window.devicePixelRatio > 2 ? 1.5 : 2;
                 if(canvasWidth * viewport.height !== canvasHeight * viewport.width ){
@@ -295,26 +393,27 @@ export default defineComponent({
                     transform,
                     viewport
                 });
-                return renderTask.promise;
+                renderTasks.add(renderTask);
+                return renderTask.promise.then(result => {
+                    renderTasks.delete(renderTask);
+                    return result;
+                }, error => {
+                    renderTasks.delete(renderTask);
+                    return Promise.reject(error);
+                });
             });
 
         }
 
         function rerender(){
-            renderList(1, Math.min(totalItems, visibleItems));
+            renderList(1, Math.min(totalItems, visibleItems), renderVersion);
         }
         onMounted(() => {
-            if (props.src) {
-                checkPdfLib().then(init).catch(e => {
-                    console.warn(e);
-                });
-            }
+            startPreview();
         });
 
         watch(() => props.src, () => {
-            checkPdfLib().then(init).catch(e => {
-                console.warn(e);
-            });
+            startPreview();
         });
         function save(fileName) {
             pdfDocument && pdfDocument._transport && pdfDocument._transport.getData().then(fileData => {

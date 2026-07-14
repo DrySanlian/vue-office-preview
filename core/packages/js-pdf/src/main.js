@@ -1,6 +1,6 @@
 import {workerStr} from './worker.js';
 import {pdfLibJsStr} from './pdf.js';
-import {download as downloadFile, getUrl, loadScript} from '../../../utils/url';
+import {download as downloadFile, getUrlInfo, loadScript} from '../../../utils/url';
 import omit from 'lodash/omit';
 import {debounce} from "lodash/function";
 
@@ -15,6 +15,10 @@ class JsPdfPreview{
     options = {};
     requestOptions = {};
     pdfDocument = null;
+    loadingTask = null;
+    renderTasks = new Set();
+    renderVersion = 0;
+    destroyed = false;
     loopCheckTimer = null;
     totalItems = 0; //pdf总页数
     pageWidth = 0;  //每个canvas dom宽度
@@ -92,9 +96,49 @@ class JsPdfPreview{
             return this.waitPdfjsLoad();
         }
     }
-    getDocument(src){
+    isCurrent(version){
+        return !this.destroyed && version === this.renderVersion;
+    }
+    cancelRenderTasks(){
+        this.renderTasks.forEach(task => {
+            try {
+                task.cancel();
+            } catch (e) {
+                // A finished PDF render task cannot be cancelled twice.
+            }
+        });
+        this.renderTasks.clear();
+    }
+    invalidatePreview(){
+        this.renderVersion += 1;
+        this.cancelRenderTasks();
+        if(this.loadingTask){
+            try {
+                const result = this.loadingTask.destroy();
+                result && typeof result.catch === 'function' && result.catch(() => {});
+            } catch (e) {
+                // The loading task may already be settled.
+            }
+            this.loadingTask = null;
+        }
+        if(this.pdfDocument){
+            try {
+                const result = this.pdfDocument.destroy();
+                result && typeof result.catch === 'function' && result.catch(() => {});
+            } catch (e) {
+                // The PDF document may already be destroyed.
+            }
+            this.pdfDocument = null;
+        }
+        this.loopCheckTimer && clearTimeout(this.loopCheckTimer);
+        this.loopCheckTimer = null;
+        this.clearAllCanvas();
+        return this.renderVersion;
+    }
+    getDocument(src, version){
+        const source = getUrlInfo(src, { type: 'application/pdf' });
         const loadingTask = window.pdfjsLib.getDocument({
-            url: getUrl(src, { type: 'application/pdf' }),
+            url: source.url,
             httpHeaders: this.requestOptions && this.requestOptions.headers,
             withCredentials: this.requestOptions && this.requestOptions.withCredentials,
             cMapUrl: `${this.options.staticFileUrl.endsWith('/') ? this.options.staticFileUrl : this.options.staticFileUrl + '/'}cmaps/`,
@@ -102,10 +146,28 @@ class JsPdfPreview{
             enableXfa: true,
             ...omit(this.options, ['width', 'staticFileUrl'])
         });
-        return loadingTask.promise;
+        this.loadingTask = loadingTask;
+        return loadingTask.promise.then(pdfDocument => {
+            source.revoke();
+            if(!this.isCurrent(version)){
+                pdfDocument.destroy();
+                return null;
+            }
+            this.loadingTask = null;
+            return pdfDocument;
+        }, error => {
+            source.revoke();
+            return Promise.reject(error);
+        });
     }
-    renderSinglePage(num, canvas){
+    renderSinglePage(num, canvas, version){
+        if(!this.isCurrent(version)){
+            return Promise.resolve();
+        }
         return this.pdfDocument.getPage(num).then((pdfPage) => {
+            if(!this.isCurrent(version)){
+                return;
+            }
             const viewport = pdfPage.getViewport({ scale: this.getViewportScale });
             let outputScale = window.devicePixelRatio > 2 ? 1.5 : 2;
             if(this.canvasWidth * viewport.height !== this.canvasHeight * viewport.width ){
@@ -126,7 +188,14 @@ class JsPdfPreview{
                 transform,
                 viewport
             });
-            return renderTask.promise;
+            this.renderTasks.add(renderTask);
+            return renderTask.promise.then(result => {
+                this.renderTasks.delete(renderTask);
+                return result;
+            }, error => {
+                this.renderTasks.delete(renderTask);
+                return Promise.reject(error);
+            });
         });
     }
     getPageSize(pdfDocument){
@@ -195,16 +264,26 @@ class JsPdfPreview{
         this.requestOptions = requestOptions;
     }
     preview(src){
+        const version = this.invalidatePreview();
         if(!src){
-            this.clearAllCanvas();
             this.options.onError && this.options.onError(new Error('预览地址不能为空'));
             return;
         }
         this.checkPdfLib().then(_=>{
-            this.getDocument(src).then(pdfDocument=>{
+            if(!this.isCurrent(version)){
+                return;
+            }
+            this.getDocument(src, version).then(pdfDocument=>{
+                if(!pdfDocument || !this.isCurrent(version)){
+                    return;
+                }
                 this.pdfDocument && this.pdfDocument.destroy();
                 this.pdfDocument = pdfDocument;
                 this.getPageSize(pdfDocument).then(res =>{
+                    if(!this.isCurrent(version)){
+                        pdfDocument.destroy();
+                        return;
+                    }
                     this.totalItems = pdfDocument.numPages;
                     this.containerHeight = this.wrapper.getBoundingClientRect().height
                     this.pageWidth = res.width;
@@ -218,21 +297,30 @@ class JsPdfPreview{
                     this.wrapperMain.style.height = height + 'px';
 
                     this.clearAllCanvas();
-                    this.renderList(1, Math.min(this.totalItems, this.visibleItems));
+                    this.renderList(1, Math.min(this.totalItems, this.visibleItems), version);
                 }).catch(e=>{
-                    this.clearAllCanvas();
-                    this.options.onError && this.options.onError(e);
+                    if(this.isCurrent(version)){
+                        this.clearAllCanvas();
+                        this.options.onError && this.options.onError(e);
+                    }
                 });
             }).catch(e=>{
-                this.clearAllCanvas();
-                this.options.onError && this.options.onError(e);
+                if(this.isCurrent(version)){
+                    this.clearAllCanvas();
+                    this.options.onError && this.options.onError(e);
+                }
             });
         }).catch(e=>{
-            this.clearAllCanvas();
-            this.options.onError && this.options.onError(e);
+            if(this.isCurrent(version)){
+                this.clearAllCanvas();
+                this.options.onError && this.options.onError(e);
+            }
         });
     }
-    renderList(startIndex, endIndex){
+    renderList(startIndex, endIndex, version = this.renderVersion){
+        if(!this.isCurrent(version)){
+            return;
+        }
         let list  = this.wrapperMain;
         let originNodes = [...list.childNodes]
         let tasks = [];
@@ -240,7 +328,7 @@ class JsPdfPreview{
             for (let i = startIndex; i <= endIndex; i++) {
                 let canvas = this.createCanvas(i)
                 list.appendChild(canvas);
-                tasks.push(this.renderSinglePage(i, canvas));
+                tasks.push(this.renderSinglePage(i, canvas, version));
             }
         }else{
             let min = +originNodes[0].getAttribute('data-id');
@@ -249,7 +337,7 @@ class JsPdfPreview{
                 for (let i = startIndex; i <= endIndex; i++) {
                     let canvas = this.createCanvas(i)
                     list.appendChild(canvas);
-                    tasks.push(this.renderSinglePage(i, canvas));
+                    tasks.push(this.renderSinglePage(i, canvas, version));
                 }
             }
 
@@ -259,7 +347,7 @@ class JsPdfPreview{
                     let canvas = this.createCanvas(i);
                     list.insertBefore(canvas, firstChildNode);
                     firstChildNode = canvas;
-                    tasks.push(this.renderSinglePage(i, canvas));
+                    tasks.push(this.renderSinglePage(i, canvas, version));
                 }
             }
 
@@ -274,14 +362,18 @@ class JsPdfPreview{
                 for (let i = max + 1; i <= endIndex; i++) {
                     let canvas = this.createCanvas(i)
                     list.appendChild(canvas);
-                    tasks.push(this.renderSinglePage(i, canvas));
+                    tasks.push(this.renderSinglePage(i, canvas, version));
                 }
             }
         }
         Promise.all(tasks).then(_=>{
-            this.options.onRendered && this.options.onRendered();
+            if(this.isCurrent(version)){
+                this.options.onRendered && this.options.onRendered();
+            }
         }).catch(e =>{
-            this.options.onError && this.options.onError(e);
+            if(this.isCurrent(version)){
+                this.options.onError && this.options.onError(e);
+            }
         });
     }
     rerender(){
@@ -293,6 +385,11 @@ class JsPdfPreview{
         });
     }
     destroy(){
+        if(this.destroyed){
+            return;
+        }
+        this.destroyed = true;
+        this.invalidatePreview();
         this.wrapper.removeEventListener('scroll', this.onScroll);
         this.container.removeChild(this.wrapper);
         this.container = null;
@@ -300,9 +397,6 @@ class JsPdfPreview{
         this.wrapperMain = null;
         this.options = {};
         this.requestOptions = {};
-        this.pdfDocument && this.pdfDocument.destroy();
-        this.pdfDocument = null;
-        this.loopCheckTimer && clearTimeout(this.loopCheckTimer);
     }
 }
 export function init(container, options, requestOptions){

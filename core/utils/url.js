@@ -1,15 +1,21 @@
-export function getUrl(src, options){
+const noop = () => {};
+
+export function getUrlInfo(src, options){
     if(typeof src === 'string'){
-        return src;
+        return {url: src, revoke: noop};
     }else if(src instanceof Blob){
-        return URL.createObjectURL(src);
+        const url = URL.createObjectURL(src);
+        return {url, revoke: () => URL.revokeObjectURL(url)};
     }else if(src instanceof ArrayBuffer){
-        return URL.createObjectURL(new Blob([src], options));
-    }else if(src instanceof Response){
-        return URL.createObjectURL(src.blob());
+        const url = URL.createObjectURL(new Blob([src], options));
+        return {url, revoke: () => URL.revokeObjectURL(url)};
     }else{
-        return src;
+        return {url: src, revoke: noop};
     }
+}
+
+export function getUrl(src, options){
+    return getUrlInfo(src, options).url;
 }
 
 export function loadScript(src){
@@ -33,7 +39,9 @@ export async function download(filename, data){
    if (data instanceof ArrayBuffer) {
        data = new Blob([data]);
     }
-    downloadFile(filename, URL.createObjectURL(data));
+    const url = URL.createObjectURL(data);
+    downloadFile(filename, url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 export function downloadFile(filename, href){

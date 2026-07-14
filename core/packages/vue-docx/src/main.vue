@@ -1,5 +1,5 @@
 <script>
-import {defineComponent, ref, onMounted, watch} from 'vue-demi';
+import {defineComponent, ref, onMounted, onBeforeUnmount, watch} from 'vue-demi';
 import docx from './docx';
 import {download as downloadFile} from '../../../utils/url';
 
@@ -20,19 +20,73 @@ export default defineComponent({
     setup(props, {emit}) {
         const rootRef = ref(null);
         let fileData = null;
+        let renderVersion = 0;
+        let destroyed = false;
+        let requestController = null;
+
+        function cancelRequest(){
+            if (requestController) {
+                requestController.abort();
+                requestController = null;
+            }
+        }
+
+        function isCurrent(version){
+            return !destroyed && version === renderVersion;
+        }
+
+        function clearPreview(){
+            if (rootRef.value) {
+                rootRef.value.innerHTML = '';
+            }
+        }
+
         function init() {
             let container = rootRef.value;
-            docx.getData(props.src, props.requestOptions).then(async res => {
+            const version = ++renderVersion;
+            const src = props.src;
+            cancelRequest();
+            if (!src || !container) {
+                clearPreview();
+                return;
+            }
+            const controller = typeof AbortController === 'function' ? new AbortController() : null;
+            requestController = controller;
+            const requestOptions = controller
+                ? {...props.requestOptions, signal: controller.signal}
+                : props.requestOptions;
+            clearPreview();
+            docx.getData(src, requestOptions).then(async res => {
+                if (requestController === controller) {
+                    requestController = null;
+                }
+                if (!isCurrent(version)) {
+                    return;
+                }
                 fileData = await docx.getBlob(res);
-                docx.render(fileData, container, props.options).then(() => {
+                if (!isCurrent(version)) {
+                    return;
+                }
+                return docx.render(fileData, container, props.options).then(() => {
+                    if (!isCurrent(version)) {
+                        return;
+                    }
                     emit('rendered');
                 }).catch(e => {
-                    docx.render('', container, props.options);
+                    if (!isCurrent(version)) {
+                        return;
+                    }
+                    clearPreview();
                     emit('error', e);
                 });
             }).catch(e => {
-                docx.render('', container, props.options);
-                emit('error', e);
+                if (requestController === controller) {
+                    requestController = null;
+                }
+                if (isCurrent(version)) {
+                    clearPreview();
+                    emit('error', e);
+                }
             });
         }
 
@@ -46,10 +100,18 @@ export default defineComponent({
             if (props.src) {
                 init();
             } else {
-                docx.render('', rootRef.value, props.options).then(() => {
-                    emit('rendered');
-                });
+                renderVersion += 1;
+                cancelRequest();
+                clearPreview();
+                emit('rendered');
             }
+        });
+
+        onBeforeUnmount(() => {
+            destroyed = true;
+            renderVersion += 1;
+            cancelRequest();
+            clearPreview();
         });
         function save(fileName){
             downloadFile(fileName || `vue-office-docx-${new Date().getTime()}.docx`,fileData);

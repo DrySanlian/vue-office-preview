@@ -1,5 +1,6 @@
 import Spreadsheet from '../../vue-excel/src/x-spreadsheet/index';
 import {getData, readExcelData, transferExcelToSpreadSheet} from '../../vue-excel/src/excel';
+import {ExcelWorkerClient, getWorkerOptions} from '../../vue-excel/src/worker-client';
 import {renderImage, clearCache} from '../../vue-excel/src/media';
 import {readOnlyInput} from '../../vue-excel/src/hack';
 import {debounce} from 'lodash';
@@ -24,6 +25,10 @@ class JsExcelPreview {
     offset = null;
     observer = null;
     fileData = null;
+    renderVersion = 0;
+    destroyed = false;
+    requestController = null;
+    workerClient = null;
 
     constructor(container, options={}, requestOptions={}) {
         this.container = container;
@@ -112,16 +117,38 @@ class JsExcelPreview {
         const canvas = this.wrapperMain.querySelector('canvas');
         this.ctx = canvas.getContext('2d');
     }
-    renderExcel(buffer){
+    renderExcel(buffer, version){
+        if(this.destroyed || version !== this.renderVersion || !this.xs){
+            return Promise.resolve();
+        }
         this.fileData = buffer;
-        return readExcelData(buffer, this.options.xls).then(workbook => {
-            if (!workbook._worksheets || workbook._worksheets.length === 0) {
-                throw new Error('未获取到数据，可能文件格式不正确或文件已损坏');
+        const options = {...defaultOptions, ...this.options};
+        const client = !this.options.beforeTransformData && this.getWorkerClient();
+        const parsePromise = client
+            ? client.parse(buffer, getWorkerOptions(options))
+            : readExcelData(buffer, this.options.xls).then(workbook => ({workbook}));
+        return parsePromise.then(parsed => {
+            if(this.destroyed || version !== this.renderVersion || !this.xs){
+                return;
             }
-            if(this.options.beforeTransformData && typeof this.options.beforeTransformData === 'function' ){
-                workbook = this.options.beforeTransformData(workbook);
+            let workbookData;
+            let medias;
+            let workbookSource;
+            if (parsed.workbook) {
+                let workbook = parsed.workbook;
+                if(this.options.beforeTransformData && typeof this.options.beforeTransformData === 'function' ){
+                    workbook = this.options.beforeTransformData(workbook);
+                }
+                const result = transferExcelToSpreadSheet(workbook, options);
+                workbookData = result.workbookData;
+                medias = result.medias;
+                workbookSource = result.workbookSource;
+            } else {
+                this.fileData = parsed.buffer || buffer;
+                workbookData = parsed.workbookData;
+                medias = parsed.medias;
+                workbookSource = parsed.workbookSource;
             }
-            let {workbookData, medias, workbookSource} = transferExcelToSpreadSheet(workbook, this.options);
             if(this.options.transformData && typeof this.options.transformData === 'function' ){
                 workbookData = this.options.transformData(workbookData);
             }
@@ -134,6 +161,9 @@ class JsExcelPreview {
             renderImage(this.ctx, this.mediasSource,this.workbookDataSource._worksheets[this.sheetIndex], this.offset);
 
         }).catch(e => {
+            if(this.destroyed || version !== this.renderVersion || !this.xs){
+                return;
+            }
             this.mediasSource = [];
             this.workbookDataSource = {
                 _worksheets:[]
@@ -157,10 +187,45 @@ class JsExcelPreview {
     setRequestOptions(requestOptions) {
         this.requestOptions = requestOptions;
     }
+    getWorkerClient(){
+        if(this.workerClient || typeof Worker !== 'function'){
+            return this.workerClient;
+        }
+        try {
+            this.workerClient = new ExcelWorkerClient(() => new Worker(
+                new URL('./excel.worker.js', import.meta.url),
+                {type: 'module'}
+            ));
+        } catch (e) {
+            this.workerClient = null;
+        }
+        return this.workerClient;
+    }
+    cancelRequest(){
+        if(this.requestController){
+            this.requestController.abort();
+            this.requestController = null;
+        }
+        this.workerClient && this.workerClient.cancel();
+        }
     preview(src){
+        const version = ++this.renderVersion;
+        this.cancelRequest();
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        this.requestController = controller;
+        const requestOptions = controller
+            ? {...this.requestOptions, signal: controller.signal}
+            : this.requestOptions;
         return new Promise(((resolve, reject) => {
-            getData(src, this.requestOptions).then((res)=>{
-                this.renderExcel(res).then(resolve).catch(e =>{
+            getData(src, requestOptions).then((res)=>{
+                if(this.requestController === controller){
+                    this.requestController = null;
+                }
+                this.renderExcel(res, version).then(resolve).catch(e =>{
+                    if(this.destroyed || version !== this.renderVersion || !this.xs){
+                        resolve();
+                        return;
+                    }
                     this.mediasSource = [];
                     this.workbookDataSource = {
                         _worksheets:[]
@@ -169,6 +234,13 @@ class JsExcelPreview {
                     reject(e);
                 });
             }).catch(e => {
+                if(this.requestController === controller){
+                    this.requestController = null;
+                }
+                if(this.destroyed || version !== this.renderVersion || !this.xs){
+                    resolve();
+                    return;
+                }
                 this.mediasSource = [];
                 this.workbookDataSource = {
                     _worksheets:[]
@@ -182,7 +254,16 @@ class JsExcelPreview {
         downloadFile(fileName || `js-preview-excel-${new Date().getTime()}.xlsx`,this.fileData);
     }
     destroy(){
-        this.observer.disconnect();
+        if(this.destroyed){
+            return;
+        }
+        this.destroyed = true;
+        this.renderVersion += 1;
+        this.cancelRequest();
+        this.workerClient && this.workerClient.destroy();
+        this.workerClient = null;
+        this.observer && this.observer.disconnect();
+        this.xs && this.xs.destroy();
         this.container.removeChild(this.wrapper);
         this.container = null;
         this.wrapper = null;

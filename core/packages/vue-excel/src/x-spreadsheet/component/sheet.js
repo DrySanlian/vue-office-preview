@@ -2,6 +2,7 @@
 import { h } from './element';
 import {
   bind,
+  unbind,
   mouseMoveUp,
   bindTouch,
   createEventEmitter,
@@ -715,179 +716,162 @@ function sheetInitEvents() {
     }
   };
 
-  bind(window, 'resize', () => {
-    this.reload();
-  });
+  this.windowEventHandlers = {
+    resize: () => {
+      this.reload();
+    },
+    click: (evt) => {
+      this.focusing = overlayerEl.contains(evt.target);
+    },
+    paste: (evt) => {
+      if (!this.focusing) return;
+      paste.call(this, 'all', evt);
+      evt.preventDefault();
+    },
+    copy: (evt) => {
+      if (!this.focusing) return;
+      copy.call(this, evt);
+      evt.preventDefault();
+    },
+    keydown: (evt) => {
+      if (!this.focusing) return;
+      const keyCode = evt.keyCode || evt.which;
+      const {
+        key, ctrlKey, shiftKey, metaKey,
+      } = evt;
+      // console.log('keydown.evt: ', keyCode);
+      if (ctrlKey || metaKey) {
+        // const { sIndexes, eIndexes } = selector;
+        // let what = 'all';
+        // if (shiftKey) what = 'text';
+        // if (altKey) what = 'format';
+        switch (keyCode) {
+          case 90:
+            // ctrl + z
+            this.undo();
+            evt.preventDefault();
+            break;
+          case 89:
+            // ctrl + y
+            this.redo();
+            evt.preventDefault();
+            break;
+          case 67:
+            // ctrl + c
+            break;
+          case 88:
+            cut.call(this);
+            evt.preventDefault();
+            break;
+          case 85:
+            toolbar.trigger('underline');
+            evt.preventDefault();
+            break;
+          case 86:
+            // ctrl + v
+            break;
+          case 37:
+            selectorMove.call(this, shiftKey, 'row-first');
+            evt.preventDefault();
+            break;
+          case 38:
+            selectorMove.call(this, shiftKey, 'col-first');
+            evt.preventDefault();
+            break;
+          case 39:
+            selectorMove.call(this, shiftKey, 'row-last');
+            evt.preventDefault();
+            break;
+          case 40:
+            selectorMove.call(this, shiftKey, 'col-last');
+            evt.preventDefault();
+            break;
+          case 32:
+            selectorSet.call(this, false, -1, this.data.selector.ci, false);
+            evt.preventDefault();
+            break;
+          case 66:
+            toolbar.trigger('bold');
+            break;
+          case 73:
+            toolbar.trigger('italic');
+            break;
+          default:
+            break;
+        }
+      } else {
+        switch (keyCode) {
+          case 32:
+            if (shiftKey) {
+              selectorSet.call(this, false, this.data.selector.ri, -1, false);
+            }
+            break;
+          case 27:
+            contextMenu.hide();
+            clearClipboard.call(this);
+            break;
+          case 37:
+            selectorMove.call(this, shiftKey, 'left');
+            evt.preventDefault();
+            break;
+          case 38:
+            selectorMove.call(this, shiftKey, 'up');
+            evt.preventDefault();
+            break;
+          case 39:
+            selectorMove.call(this, shiftKey, 'right');
+            evt.preventDefault();
+            break;
+          case 40:
+            selectorMove.call(this, shiftKey, 'down');
+            evt.preventDefault();
+            break;
+          case 9:
+            editor.clear();
+            selectorMove.call(this, false, shiftKey ? 'left' : 'right');
+            evt.preventDefault();
+            break;
+          case 13:
+            editor.clear();
+            selectorMove.call(this, false, shiftKey ? 'up' : 'down');
+            evt.preventDefault();
+            break;
+          case 8:
+            insertDeleteRowColumn.call(this, 'delete-cell-text');
+            evt.preventDefault();
+            break;
+          default:
+            break;
+        }
 
-  bind(window, 'click', (evt) => {
-    this.focusing = overlayerEl.contains(evt.target);
-  });
-
-  bind(window, 'paste', (evt) => {
-    if (!this.focusing) return;
-    paste.call(this, 'all', evt);
-    evt.preventDefault();
-  });
-
-  bind(window, 'copy', (evt) => {
-    if (!this.focusing) return;
-    copy.call(this, evt);
-    evt.preventDefault();
-  });
-
-  // for selector
-  bind(window, 'keydown', (evt) => {
-    if (!this.focusing) return;
-    const keyCode = evt.keyCode || evt.which;
-    const {
-      key, ctrlKey, shiftKey, metaKey,
-    } = evt;
-    // console.log('keydown.evt: ', keyCode);
-    if (ctrlKey || metaKey) {
-      // const { sIndexes, eIndexes } = selector;
-      // let what = 'all';
-      // if (shiftKey) what = 'text';
-      // if (altKey) what = 'format';
-      switch (keyCode) {
-        case 90:
-          // undo: ctrl + z
-          this.undo();
-          evt.preventDefault();
-          break;
-        case 89:
-          // redo: ctrl + y
-          this.redo();
-          evt.preventDefault();
-          break;
-        case 67:
-          // ctrl + c
-          // => copy
-          // copy.call(this);
-          // evt.preventDefault();
-          break;
-        case 88:
-          // ctrl + x
-          cut.call(this);
-          evt.preventDefault();
-          break;
-        case 85:
-          // ctrl + u
-          toolbar.trigger('underline');
-          evt.preventDefault();
-          break;
-        case 86:
-          // ctrl + v
-          // => paste
-          // evt.preventDefault();
-          break;
-        case 37:
-          // ctrl + left
-          selectorMove.call(this, shiftKey, 'row-first');
-          evt.preventDefault();
-          break;
-        case 38:
-          // ctrl + up
-          selectorMove.call(this, shiftKey, 'col-first');
-          evt.preventDefault();
-          break;
-        case 39:
-          // ctrl + right
-          selectorMove.call(this, shiftKey, 'row-last');
-          evt.preventDefault();
-          break;
-        case 40:
-          // ctrl + down
-          selectorMove.call(this, shiftKey, 'col-last');
-          evt.preventDefault();
-          break;
-        case 32:
-          // ctrl + space, all cells in col
-          selectorSet.call(this, false, -1, this.data.selector.ci, false);
-          evt.preventDefault();
-          break;
-        case 66:
-          // ctrl + B
-          toolbar.trigger('bold');
-          break;
-        case 73:
-          // ctrl + I
-          toolbar.trigger('italic');
-          break;
-        default:
-          break;
-      }
-    } else {
-      // console.log('evt.keyCode:', evt.keyCode);
-      switch (keyCode) {
-        case 32:
-          if (shiftKey) {
-            // shift + space, all cells in row
-            selectorSet.call(this, false, this.data.selector.ri, -1, false);
-          }
-          break;
-        case 27: // esc
-          contextMenu.hide();
-          clearClipboard.call(this);
-          break;
-        case 37: // left
-          selectorMove.call(this, shiftKey, 'left');
-          evt.preventDefault();
-          break;
-        case 38: // up
-          selectorMove.call(this, shiftKey, 'up');
-          evt.preventDefault();
-          break;
-        case 39: // right
-          selectorMove.call(this, shiftKey, 'right');
-          evt.preventDefault();
-          break;
-        case 40: // down
-          selectorMove.call(this, shiftKey, 'down');
-          evt.preventDefault();
-          break;
-        case 9: // tab
-          editor.clear();
-          // shift + tab => move left
-          // tab => move right
-          selectorMove.call(this, false, shiftKey ? 'left' : 'right');
-          evt.preventDefault();
-          break;
-        case 13: // enter
-          editor.clear();
-          // shift + enter => move up
-          // enter => move down
-          selectorMove.call(this, false, shiftKey ? 'up' : 'down');
-          evt.preventDefault();
-          break;
-        case 8: // backspace
+        if (key === 'Delete') {
           insertDeleteRowColumn.call(this, 'delete-cell-text');
           evt.preventDefault();
-          break;
-        default:
-          break;
-      }
-
-      if (key === 'Delete') {
-        insertDeleteRowColumn.call(this, 'delete-cell-text');
-        evt.preventDefault();
-      } else if ((keyCode >= 65 && keyCode <= 90)
-        || (keyCode >= 48 && keyCode <= 57)
-        || (keyCode >= 96 && keyCode <= 105)
-        || evt.key === '='
-      ) {
-        dataSetCellText.call(this, evt.key, 'input');
-        editorSet.call(this);
-      } else if (keyCode === 113) {
-        // F2
-        editorSet.call(this);
+        } else if ((keyCode >= 65 && keyCode <= 90)
+          || (keyCode >= 48 && keyCode <= 57)
+          || (keyCode >= 96 && keyCode <= 105)
+          || evt.key === '='
+        ) {
+          dataSetCellText.call(this, evt.key, 'input');
+          editorSet.call(this);
+        } else if (keyCode === 113) {
+          editorSet.call(this);
+        }
       }
     }
-  });
+  };
+
+  bind(window, 'resize', this.windowEventHandlers.resize);
+  bind(window, 'click', this.windowEventHandlers.click);
+  bind(window, 'paste', this.windowEventHandlers.paste);
+  bind(window, 'copy', this.windowEventHandlers.copy);
+  bind(window, 'keydown', this.windowEventHandlers.keydown);
 }
 
 export default class Sheet {
   constructor(targetEl, data) {
     this.eventMap = createEventEmitter();
+    this.windowEventHandlers = null;
     const { view, showToolbar, showContextmenu } = data.settings;
     this.el = h('div', `${cssPrefix}-sheet`);
     this.toolbar = new Toolbar(data, view.width, !showToolbar);
@@ -946,6 +930,17 @@ export default class Sheet {
   on(eventName, func) {
     this.eventMap.on(eventName, func);
     return this;
+  }
+
+  destroy() {
+    if (this.windowEventHandlers) {
+      Object.keys(this.windowEventHandlers).forEach((eventName) => {
+        unbind(window, eventName, this.windowEventHandlers[eventName]);
+      });
+      this.windowEventHandlers = null;
+    }
+    this.eventMap.removeAllListeners();
+    this.el = null;
   }
 
   trigger(eventName, ...args) {

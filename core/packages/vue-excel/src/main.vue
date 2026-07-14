@@ -2,8 +2,8 @@
 import {defineComponent, ref, onMounted, onBeforeUnmount, watch, nextTick} from 'vue-demi';
 import Spreadsheet from './x-spreadsheet/index';
 import {getData, readExcelData, transferExcelToSpreadSheet} from './excel';
+import {ExcelWorkerClient, getWorkerOptions} from './worker-client';
 import {renderImage, clearCache} from './media';
-import {readOnlyInput} from './hack';
 import {debounce} from 'lodash';
 import {download as downloadFile} from '../../../utils/url';
 
@@ -39,17 +39,70 @@ export default defineComponent({
         let xs = null;
         let offset = null;
         let fileData = null;
+        let renderVersion = 0;
+        let destroyed = false;
+        let requestController = null;
+        let workerClient = null;
 
-        function renderExcel(buffer) {
+        function getWorkerClient(){
+            if (workerClient || typeof Worker !== 'function') {
+                return workerClient;
+            }
+            try {
+                workerClient = new ExcelWorkerClient(() => new Worker(
+                    new URL('./excel.worker.js', import.meta.url),
+                    {type: 'module'}
+                ));
+            } catch (e) {
+                workerClient = null;
+            }
+            return workerClient;
+        }
+
+        function cancelRequest(){
+            if (requestController) {
+                requestController.abort();
+                requestController = null;
+            }
+            workerClient && workerClient.cancel();
+        }
+
+        function isCurrent(version) {
+            return !destroyed && version === renderVersion && xs;
+        }
+
+        function renderExcel(buffer, version) {
+            if (!isCurrent(version)) {
+                return;
+            }
             fileData = buffer;
-            readExcelData(buffer, props.options.xls).then(workbook => {
-                if (!workbook._worksheets || workbook._worksheets.length === 0) {
-                    throw new Error('未获取到数据，可能文件格式不正确或文件已损坏');
+            const options = {...defaultOptions, ...props.options};
+            const client = !props.options.beforeTransformData && getWorkerClient();
+            const parsePromise = client
+                ? client.parse(buffer, getWorkerOptions(options))
+                : readExcelData(buffer, props.options.xls).then(workbook => ({workbook}));
+            parsePromise.then(parsed => {
+                if (!isCurrent(version)) {
+                    return;
                 }
-                if(props.options.beforeTransformData && typeof props.options.beforeTransformData === 'function' ){
-                    workbook = props.options.beforeTransformData(workbook);
+                let workbookData;
+                let medias;
+                let workbookSource;
+                if (parsed.workbook) {
+                    let workbook = parsed.workbook;
+                    if(props.options.beforeTransformData && typeof props.options.beforeTransformData === 'function' ){
+                        workbook = props.options.beforeTransformData(workbook);
+                    }
+                    const result = transferExcelToSpreadSheet(workbook, options);
+                    workbookData = result.workbookData;
+                    medias = result.medias;
+                    workbookSource = result.workbookSource;
+                } else {
+                    fileData = parsed.buffer || buffer;
+                    workbookData = parsed.workbookData;
+                    medias = parsed.medias;
+                    workbookSource = parsed.workbookSource;
                 }
-                let {workbookData, medias, workbookSource} = transferExcelToSpreadSheet(workbook, {...defaultOptions, ...props.options});
                 if(props.options.transformData && typeof props.options.transformData === 'function' ){
                     workbookData = props.options.transformData(workbookData);
                 }
@@ -65,6 +118,9 @@ export default defineComponent({
                 //涉及clear和offset
 
             }).catch(e => {
+                if (!isCurrent(version)) {
+                    return;
+                }
                 console.warn(e);
                 mediasSource = [];
                 workbookDataSource = {
@@ -74,6 +130,38 @@ export default defineComponent({
                 xs && xs.loadData({});
                 emit('error', e);
                 emit('switchSheet', 0);
+            });
+        }
+
+        function loadSource(src) {
+            const version = ++renderVersion;
+            cancelRequest();
+            if (!src) {
+                return;
+            }
+            const controller = typeof AbortController === 'function' ? new AbortController() : null;
+            requestController = controller;
+            const requestOptions = controller
+                ? {...props.requestOptions, signal: controller.signal}
+                : props.requestOptions;
+            getData(src, requestOptions).then(buffer => {
+                if (requestController === controller) {
+                    requestController = null;
+                }
+                renderExcel(buffer, version);
+            }).catch(e => {
+                if (requestController === controller) {
+                    requestController = null;
+                }
+                if (!isCurrent(version)) {
+                    return;
+                }
+                mediasSource = [];
+                workbookDataSource = {
+                    _worksheets:[]
+                };
+                xs.loadData({});
+                emit('error', e);
             });
         }
         
@@ -154,37 +242,31 @@ export default defineComponent({
                 const canvas = rootRef.value.querySelector('canvas');
                 ctx = canvas.getContext('2d');
                 if (props.src) {
-                    getData(props.src, props.requestOptions).then(renderExcel).catch(e => {
-                        mediasSource = [];
-                        workbookDataSource = {
-                            _worksheets:[]
-                        };
-                        xs.loadData({});
-                        emit('error', e);
-                    });
+                    loadSource(props.src);
                 }
             });
         });
 
         onBeforeUnmount(()=>{
+            destroyed = true;
+            renderVersion += 1;
+            cancelRequest();
+            workerClient && workerClient.destroy();
+            workerClient = null;
+            xs && xs.destroy();
             xs = null;
         });
         watch(() => props.src, () => {
             if (props.src) {
-                getData(props.src, props.requestOptions).then(renderExcel).catch(e => {
-                    mediasSource = [];
-                    workbookDataSource = {
-                        _worksheets:[]
-                    };
-                    xs.loadData({});
-                    emit('error', e);
-                });
+                loadSource(props.src);
             } else {
+                renderVersion += 1;
+                cancelRequest();
                 mediasSource = [];
                 workbookDataSource = {
                     _worksheets:[]
                 };
-                xs.loadData({});
+                xs && xs.loadData({});
                 emit('error', new Error('src属性不能为空'));
             }
         });

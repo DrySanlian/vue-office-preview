@@ -17,6 +17,7 @@ class Spreadsheet {
     if (typeof selectors === 'string') {
       targetEl = document.querySelector(selectors);
     }
+    this.targetEl = targetEl;
     this.bottombar = this.options.showBottomBar ? new Bottombar(() => {
       if (this.options.mode === 'read') return;
       const d = this.addSheet();
@@ -35,6 +36,7 @@ class Spreadsheet {
       .on('contextmenu', evt => evt.preventDefault());
     // create canvas element
     targetEl.appendChild(rootEl.el);
+    this.rootEl = rootEl.el;
     this.sheet = new Sheet(rootEl, this.data);
     if (this.bottombar !== null) {
       rootEl.child(this.bottombar.el);
@@ -121,6 +123,18 @@ class Spreadsheet {
   change(cb) {
     this.sheet.on('change', cb);
     return this;
+  }
+
+  destroy() {
+    this.sheet && this.sheet.destroy();
+    if (this.rootEl && this.rootEl.parentNode) {
+      this.rootEl.parentNode.removeChild(this.rootEl);
+    }
+    this.targetEl = null;
+    this.rootEl = null;
+    this.sheet = null;
+    this.bottombar = null;
+    this.datas = [];
   }
 
   static locale(lang, message) {

@@ -1,7 +1,7 @@
 import * as Excel from 'exceljs/dist/exceljs';
-import {getUrl} from '../../../utils/url';
+import {getUrlInfo} from '../../../utils/url';
 import tinycolor from 'tinycolor2';
-import {cloneDeep, get, find} from 'lodash';
+import {cloneDeep, get} from 'lodash';
 import {getDarkColor, getLightColor} from './color';
 import dayjs from 'dayjs';
 import {read, write} from 'xlsx';
@@ -90,23 +90,56 @@ const indexedColor = [
 let defaultColWidth = 80;
 let defaultRowHeight = 24;
 export function getData(src, options={}) {
-    return requestExcel(getUrl(src), options);
+    const source = getUrlInfo(src);
+    return requestExcel(source.url, options).then(data => {
+        source.revoke();
+        return data;
+    }, error => {
+        source.revoke();
+        return Promise.reject(error);
+    });
 }
 
 function requestExcel(src, options) {
     return new Promise(function(resolve, reject) {
         const xhr = new XMLHttpRequest();
+        let settled = false;
+        const cleanup = () => {
+            options.signal && options.signal.removeEventListener('abort', abortRequest);
+        };
+        const resolveRequest = (value) => {
+            if (!settled) {
+                settled = true;
+                cleanup();
+                resolve(value);
+            }
+        };
+        const rejectRequest = (error) => {
+            if (!settled) {
+                settled = true;
+                cleanup();
+                reject(error);
+            }
+        };
+        const abortRequest = () => {
+            xhr.abort();
+        };
         xhr.open(options.method || 'GET', src, true);
         xhr.responseType = options.responseType || 'arraybuffer';
         xhr.onload = function() {
-          if (xhr.status === 200) {
-            resolve(xhr.response);
+          if (xhr.status >= 200 && xhr.status < 300 || xhr.status === 0) {
+            resolveRequest(xhr.response);
           } else {
-            reject(xhr.status);
+            rejectRequest(new Error(`Excel请求失败: ${xhr.status}`));
           }
         };
         xhr.onerror = function() {
-          reject(xhr.status);
+          rejectRequest(new Error(`Excel请求失败: ${xhr.status}`));
+        };
+        xhr.onabort = function() {
+            const error = new Error('Excel请求已取消');
+            error.name = 'AbortError';
+            rejectRequest(error);
         };
         xhr.withCredentials = options.withCredentials || false;
         if(options.headers) {
@@ -115,6 +148,13 @@ function requestExcel(src, options) {
             });
         }
 
+        if(options.signal) {
+            if(options.signal.aborted) {
+                abortRequest();
+                return;
+            }
+            options.signal.addEventListener('abort', abortRequest, {once: true});
+        }
         xhr.send(options.body);
     });
 }
@@ -361,9 +401,29 @@ function getStyle(cell){
     return cell.style;
 }
 
+function createMediaWorkbookSource(workbook, sheets){
+    return {
+        _worksheets: sheets.map(sheet => ({
+            _columns: (sheet._columns || []).map(column => ({
+                width: column.width,
+                _hidden: column._hidden
+            })),
+            _rows: (sheet._rows || []).map(row => ({
+                height: row.height,
+                _hidden: row._hidden
+            })),
+            _media: (sheet._media || []).map(media => ({
+                imageId: media.imageId,
+                type: media.type,
+                range: media.range
+            }))
+        })),
+        media: (workbook.media || []).map(media => ({...media}))
+    };
+}
+
 export function transferExcelToSpreadSheet(workbook, options){
     let workbookData = [];
-    console.log(workbook, 'workbook');
     let sheets = [];
     workbook.eachSheet((sheet) => {
         sheets.push(sheet);
@@ -371,7 +431,7 @@ export function transferExcelToSpreadSheet(workbook, options){
         // 构造x-data-spreadsheet 的 sheet 数据源结构
         let sheetData = { name: sheet.name,styles : [], rows: {},cols:{}, merges:[],media:[] };
         // 收集合并单元格信息
-        let mergeAddressData = [];
+        let mergeAddressMap = new Map();
         for(let mergeRange in sheet._merges) {
             sheetData.merges.push(sheet._merges[mergeRange].shortRange);
             let mergeAddress = {};
@@ -383,28 +443,29 @@ export function transferExcelToSpreadSheet(workbook, options){
             mergeAddress.YRange = sheet._merges[mergeRange].model.bottom - sheet._merges[mergeRange].model.top;
             // X轴方向跨度
             mergeAddress.XRange = sheet._merges[mergeRange].model.right - sheet._merges[mergeRange].model.left;
-            mergeAddressData.push(mergeAddress);
+            mergeAddressMap.set(mergeAddress.startAddress, mergeAddress);
         }
+        const styleIndexes = new Map();
 
         let effectiveMaxColLen = 0; //真正有数据的列长度，有时excel会展示一堆没数据的列
         // 遍历行
         (sheet._rows || []).forEach((row,spreadSheetRowIndex) =>{
 
             sheetData.rows[spreadSheetRowIndex] = { cells: {} };
+            const cells = row._hidden ? [] : (row._cells || []);
             if(row._hidden){
                 sheetData.rows[spreadSheetRowIndex].height = 0.1;
-                row._cells = [];
             }else if(row.height){
                 sheetData.rows[spreadSheetRowIndex].height = row.height + (options.heightOffset || 0);
             }else{
                 sheetData.rows[spreadSheetRowIndex].height = defaultRowHeight + (options.heightOffset || 0);
             }
             //includeEmpty = false 不包含空白单元格
-            (row._cells || []).forEach((cell, spreadSheetColIndex) =>{
+            cells.forEach((cell, spreadSheetColIndex) =>{
                 sheetData.rows[spreadSheetRowIndex].cells[spreadSheetColIndex] = {};
                 effectiveMaxColLen = Math.max(effectiveMaxColLen, spreadSheetColIndex);
 
-                let mergeAddress = find(mergeAddressData, function(o) { return o.startAddress == cell._address; });
+                let mergeAddress = mergeAddressMap.get(cell._address);
                 if(mergeAddress && cell.master.address != mergeAddress.startAddress) {
                     return;
                 }
@@ -412,8 +473,15 @@ export function transferExcelToSpreadSheet(workbook, options){
                     sheetData.rows[spreadSheetRowIndex].cells[spreadSheetColIndex].merge = [mergeAddress.YRange, mergeAddress.XRange];
                 }
                 sheetData.rows[spreadSheetRowIndex].cells[spreadSheetColIndex].text = getCellText(cell);
-                sheetData.styles.push(getStyle(cell));
-                sheetData.rows[spreadSheetRowIndex].cells[spreadSheetColIndex].style = sheetData.styles.length - 1;
+                let styleIndex = styleIndexes.get(cell.styleId);
+                if (styleIndex === undefined || cell.styleId === undefined) {
+                    sheetData.styles.push(getStyle(cell));
+                    styleIndex = sheetData.styles.length - 1;
+                    if (cell.styleId !== undefined) {
+                        styleIndexes.set(cell.styleId, styleIndex);
+                    }
+                }
+                sheetData.rows[spreadSheetRowIndex].cells[spreadSheetColIndex].style = styleIndex;
             });
         });
         if(sheetData._media){
@@ -432,10 +500,9 @@ export function transferExcelToSpreadSheet(workbook, options){
         workbookData.push(sheetData);
     });
     // console.log(workbookData, 'workbookData');
-    workbook._worksheets = sheets;
     return {
         workbookData,
-        workbookSource: workbook,
+        workbookSource: createMediaWorkbookSource(workbook, sheets),
         medias: workbook.media || []
     };
 }

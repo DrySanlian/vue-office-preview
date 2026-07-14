@@ -126,10 +126,12 @@ function getImage(index, data){
         let image = new Image();
         image.src = url;
         image.onload = function (){
+            URL.revokeObjectURL(url);
             resolve(image);
             cache[index] = image;
         };
         image.onerror = function (e){
+            URL.revokeObjectURL(url);
             reject(e);
         };
     }));

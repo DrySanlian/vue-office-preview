@@ -9,8 +9,8 @@
   ],
   "scripts": {
     "clean": "rimraf lib",
-    "copyReadme": "cp ../../../help.md README.md",
-    "copyType": "cp index.d.ts lib/index.d.ts",
+    "copyReadme": "node ../../script/copy-files.js ../../../README.md README.md",
+    "copyType": "node ../../script/copy-files.js index.d.ts lib/index.d.ts",
     "copy": "npm run copyType && npm run copyReadme",
     "build": "npm run clean && rollup --config rollup.config.js && npm run copy"
   },

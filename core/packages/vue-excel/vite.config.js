@@ -15,7 +15,7 @@ export default defineConfig({
         })
   ],
   build: {
-    minify: 'terser',
+    minify: 'esbuild',
     target: 'es2015',
     outDir: 'lib/v' + (isVue2 ? '2' : '3'),
     lib: {
